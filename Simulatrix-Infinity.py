@@ -20,18 +20,17 @@ import time
 import os
 from collections import deque
 from typing import List, Tuple
-from numba import njit,prange
-import numpy as np
+
 # ---------------------------
 # ========== CONFIG =========
 # ---------------------------
 WIDTH, HEIGHT = 1200, 700
-FPS_TARGET = 100
+FPS_TARGET = 60
 
 # initial scene parameters
 NUM_BALLS = 200
 MIN_RADIUS, MAX_RADIUS = 4, 10
-AUTO_CELL_FACTOR = 0.9       # cell_size = AUTO_CELL_FACTOR * max_radius
+AUTO_CELL_FACTOR = 3        # cell_size = AUTO_CELL_FACTOR * max_radius
 
 # physics defaults
 GLOBAL_GRAVITY = 0.0
@@ -56,298 +55,135 @@ INV_2PI = 1.0 / (2 * math.pi)
 
 def clamp(x, a, b): return a if x < a else (b if x > b else x)
 
-@njit(fastmath=True)
-def dot2(x1, y1, x2, y2):
-    return x1 * x2 + y1 * y2
+# 2D vector helpers using tuples for SAT where convenient
+def dot2(a, b): return a[0]*b[0] + a[1]*b[1]
+def sub2(a, b): return (a[0]-b[0], a[1]-b[1])
+def perp2(v): return (-v[1], v[0])
+def len2(v): return math.hypot(v[0], v[1])
+def normalize2(v):
+    L = len2(v)
+    if L == 0: return (0.0, 0.0)
+    return (v[0]/L, v[1]/L)
 
-@njit(fastmath=True)
-def sub2(x1, y1, x2, y2):
-    return x1 - x2, y1 - y2
-
-@njit(fastmath=True)
-def len2(x, y):
-    return (x * x + y * y) ** 0.5
-
-@njit(fastmath=True)
-def normalize2(x, y):
-    length = len2(x, y)
-    if length == 0:
-        return 0.0, 0.0
-    return x / length, y / length
-
-@njit(fastmath=True)
-def perp2(x, y):
-    return -y, x
-
-@njit(fastmath=True)
-def support_polygon(verts_x, verts_y, n, dir_x, dir_y):
-    best_dot = -1e10
-    best_x = 0.0
-    best_y = 0.0
-    for i in range(n):
-        d = dot2(verts_x[i], verts_y[i], dir_x, dir_y)
+def support_polygon(verts, direction):
+    """Support function for polygon: vertex with max dot product with direction."""
+    best = verts[0]
+    best_dot = dot2(best, direction)
+    for v in verts[1:]:
+        d = dot2(v, direction)
         if d > best_dot:
+            best = v
             best_dot = d
-            best_x = verts_x[i]
-            best_y = verts_y[i]
-    return best_x, best_y
+    return best
 
-@njit(fastmath=True)
-def support_circle(center_x, center_y, radius, dir_x, dir_y):
-    length = len2(dir_x, dir_y)
+def support_circle(center, radius, direction):
+    """Support function for circle: center + radius * normalized direction."""
+    length = len2(direction)
     if length == 0:
-        return center_x, center_y
-    nx = dir_x / length
-    ny = dir_y / length
-    return center_x + nx * radius, center_y + ny * radius
+        return center
+    norm_dir = (direction[0]/length, direction[1]/length)
+    return (center[0] + norm_dir[0]*radius, center[1] + norm_dir[1]*radius)
 
-@njit(fastmath=True)
-def support(shapeA_type, vertsA_x, vertsA_y, nA, centerA_x, centerA_y, radiusA,
-            shapeB_type, vertsB_x, vertsB_y, nB, centerB_x, centerB_y, radiusB,
-            dir_x, dir_y):
-    # Support point in Minkowski difference = supportA(dir) - supportB(-dir)
-    p1_x, p1_y = support_single(shapeA_type, vertsA_x, vertsA_y, nA, centerA_x, centerA_y, radiusA, dir_x, dir_y)
-    ndir_x, ndir_y = -dir_x, -dir_y
-    p2_x, p2_y = support_single(shapeB_type, vertsB_x, vertsB_y, nB, centerB_x, centerB_y, radiusB, ndir_x, ndir_y)
-    return p1_x - p2_x, p1_y - p2_y
-
-@njit(fastmath=True)
-def support_single(shape_type, verts_x, verts_y, n, center_x, center_y, radius, dir_x, dir_y):
-    if shape_type == 0:
-        return support_circle(center_x, center_y, radius, dir_x, dir_y)
+def support(shapeA, shapeB, direction):
+    """Support function for Minkowski difference of shapeA and shapeB."""
+    # shapeA and shapeB are dicts with 'verts' or 'circle' keys
+    if 'verts' in shapeA:
+        p1 = support_polygon(shapeA['verts'], direction)
     else:
-        return support_polygon(verts_x, verts_y, n, dir_x, dir_y)
-@njit(fastmath=True)
-def triple_product(ax, ay, bx, by, cx, cy):
-    ac = dot2(ax, ay, cx, cy)
-    ab = dot2(ax, ay, bx, by)
-    return bx * ac - cx * ab, by * ac - cy * ab
+        p1 = support_circle(shapeA['center'], shapeA['radius'], direction)
+    neg_dir = (-direction[0], -direction[1])
+    if 'verts' in shapeB:
+        p2 = support_polygon(shapeB['verts'], neg_dir)
+    else:
+        p2 = support_circle(shapeB['center'], shapeB['radius'], neg_dir)
+    return (p1[0] - p2[0], p1[1] - p2[1])
 
+def triple_product(a, b, c):
+    # triple product of vectors a,b,c = b*(a·c) - c*(a·b)
+    ac = dot2(a, c)
+    ab = dot2(a, b)
+    return (b[0]*ac - c[0]*ab, b[1]*ac - c[1]*ab)
 
-@njit(fastmath=True)
-def gjk_collision(shapeA_type, vertsA_x, vertsA_y, nA, centerA_x, centerA_y, radiusA,
-                  shapeB_type, vertsB_x, vertsB_y, nB, centerB_x, centerB_y, radiusB):
-    direction = np.array([1.0, 0.0])
-    simplex_x = []
-    simplex_y = []
-
-    p_x, p_y = support(shapeA_type, vertsA_x, vertsA_y, nA, centerA_x, centerA_y, radiusA,
-                       shapeB_type, vertsB_x, vertsB_y, nB, centerB_x, centerB_y, radiusB,
-                       direction[0], direction[1])
-    simplex_x.append(p_x)
-    simplex_y.append(p_y)
-    direction[0], direction[1] = -p_x, -p_y
-
+def gjk_collision(shapeA, shapeB):
+    direction = [1, 0]
+    simplex = []
+    p = support(shapeA, shapeB, direction)
+    simplex.append(p)
+    direction[0], direction[1] = -p[0], -p[1]
     for _ in range(30):
-        p_x, p_y = support(shapeA_type, vertsA_x, vertsA_y, nA, centerA_x, centerA_y, radiusA,
-                           shapeB_type, vertsB_x, vertsB_y, nB, centerB_x, centerB_y, radiusB,
-                           direction[0], direction[1])
-        if dot2(p_x, p_y, direction[0], direction[1]) <= 0:
-            return False, simplex_x, simplex_y
-        simplex_x.append(p_x)
-        simplex_y.append(p_y)
-        if handle_simplex(simplex_x, simplex_y, direction):
-            return True, simplex_x, simplex_y
-    return False, simplex_x, simplex_y
-
-@njit(fastmath=True)
-def handle_simplex(simplex_x, simplex_y, direction):
-    if len(simplex_x) == 2:
-        # Line segment case
-        a_x = simplex_x[-1]
-        a_y = simplex_y[-1]
-        b_x = simplex_x[-2]
-        b_y = simplex_y[-2]
-        ab_x, ab_y = sub2(b_x, b_y, a_x, a_y)
-        ao_x, ao_y = -a_x, -a_y
-        ab_perp_x, ab_perp_y = triple_product(ab_x, ab_y, ao_x, ao_y, ab_x, ab_y)
-        length = len2(ab_perp_x, ab_perp_y)
-        if length < 1e-6:
-            ab_perp_x, ab_perp_y = perp2(ab_x, ab_y)
-        direction[0], direction[1] = ab_perp_x, ab_perp_y
+        p = support(shapeA, shapeB, direction)
+        if dot2(p, direction) <= 0:
+            return False, simplex
+        simplex.append(p)
+        if handle_simplex(simplex, direction):
+            return True, simplex
+    return False, simplex
+def handle_simplex(simplex, direction):
+    if len(simplex) == 2:
+        a = simplex[-1]
+        b = simplex[-2]
+        ab = sub2(b, a)
+        ao = (-a[0], -a[1])
+        ab_perp = triple_product(ab, ao, ab)
+        if len2(ab_perp) < 1e-6:
+            ab_perp = perp2(ab)
+        direction[0], direction[1] = ab_perp
         return False
-    elif len(simplex_x) == 3:
-        a_x = simplex_x[-1]
-        a_y = simplex_y[-1]
-        b_x = simplex_x[-2]
-        b_y = simplex_y[-2]
-        c_x = simplex_x[-3]
-        c_y = simplex_y[-3]
-        ab_x, ab_y = sub2(b_x, b_y, a_x, a_y)
-        ac_x, ac_y = sub2(c_x, c_y, a_x, a_y)
-        ao_x, ao_y = -a_x, -a_y
-
-        ab_perp_x, ab_perp_y = triple_product(ac_x, ac_y, ab_x, ab_y, ab_x, ab_y)
-        ac_perp_x, ac_perp_y = triple_product(ab_x, ab_y, ac_x, ac_y, ac_x, ac_y)
-
-        if dot2(ab_perp_x, ab_perp_y, ao_x, ao_y) > 0:
-            # Remove point c
-            simplex_x.pop(-3)
-            simplex_y.pop(-3)
-            direction[0], direction[1] = ab_perp_x, ab_perp_y
+    elif len(simplex) == 3:
+        a = simplex[-1]
+        b = simplex[-2]
+        c = simplex[-3]
+        ab = sub2(b, a)
+        ac = sub2(c, a)
+        ao = (-a[0], -a[1])
+        ab_perp = triple_product(ac, ab, ab)
+        ac_perp = triple_product(ab, ac, ac)
+        if dot2(ab_perp, ao) > 0:
+            simplex.pop(-3)  # remove c
+            direction[0], direction[1] = ab_perp
             return False
-        elif dot2(ac_perp_x, ac_perp_y, ao_x, ao_y) > 0:
-            # Remove point b
-            simplex_x.pop(-2)
-            simplex_y.pop(-2)
-            direction[0], direction[1] = ac_perp_x, ac_perp_y
+        elif dot2(ac_perp, ao) > 0:
+            simplex.pop(-2)  # remove b
+            direction[0], direction[1] = ac_perp
             return False
         else:
             return True
     return False
 
-def sat_polygon_polygon(vertsA, vertsB):
-    """Return (penetration_depth, collision_normal) or (0, None) if no collision."""
-    overlap = float('inf')
-    smallest_axis = None
-
-    def get_axes(verts):
-        axes = []
-        n = len(verts)
-        for i in range(n):
-            p1 = verts[i]
-            p2 = verts[(i+1) % n]
-            edge = (p2[0] - p1[0], p2[1] - p1[1])
-            normal = normalize2(*perp2(edge[0], edge[1]))
-            axes.append(normal)
-        return axes
-
-    axesA = get_axes(vertsA)
-    axesB = get_axes(vertsB)
-
-    for axis in axesA + axesB:
-        minA, maxA = project_polygon_axis(axis, vertsA)
-        minB, maxB = project_polygon_axis(axis, vertsB)
-        dist = interval_distance(minA, maxA, minB, maxB)
-        if dist > 0:
-            return 0, None  # no collision
-        if abs(dist) < overlap:
-            overlap = abs(dist)
-            smallest_axis = axis
-
-    return overlap, smallest_axis
-
 def epa(shapeA, shapeB, simplex):
-    """
-    EPA algorithm to find penetration depth and collision normal.
-    shapeA and shapeB are tuples:
-      (shape_type, verts_x, verts_y, n, center_x, center_y, radius)
-    simplex is a list of (x,y) tuples from GJK.
-    """
-    shapeA_type, vertsA_x, vertsA_y, nA, centerA_x, centerA_y, radiusA = shapeA
-    shapeB_type, vertsB_x, vertsB_y, nB, centerB_x, centerB_y, radiusB = shapeB
-
+    """EPA algorithm to find penetration depth and normal."""
     polytope = simplex[:]
+    edges = []
     for _ in range(30):
+        # Find edge closest to origin
         min_dist = float('inf')
         closest_edge = None
         closest_index = -1
-
-        # Find edge of polytope closest to origin
         for i in range(len(polytope)):
             j = (i + 1) % len(polytope)
             a = polytope[i]
             b = polytope[j]
-            # Unpack points for sub2
-            edge = sub2(b[0], b[1], a[0], a[1])
-            normal = normalize2(*perp2(*edge))
-            dist = dot2(normal[0], normal[1], a[0], a[1])
+            edge = sub2(b, a)
+            normal = normalize2(perp2(edge))
+            dist = dot2(normal, a)
             if dist < min_dist:
                 min_dist = dist
                 closest_edge = normal
                 closest_index = j
-
         # Get support point in direction of normal
-        p_x, p_y = support(
-            shapeA_type, vertsA_x, vertsA_y, nA, centerA_x, centerA_y, radiusA,
-            shapeB_type, vertsB_x, vertsB_y, nB, centerB_x, centerB_y, radiusB,
-            closest_edge[0], closest_edge[1]
-        )
-        d = dot2(p_x, p_y, closest_edge[0], closest_edge[1])
-
+        p = support(shapeA, shapeB, closest_edge)
+        d = dot2(p, closest_edge)
         if d - min_dist < 1e-6:
             # Penetration depth and normal found
             return min_dist, closest_edge
         else:
-            polytope.insert(closest_index, (p_x, p_y))
-
+            polytope.insert(closest_index, p)
     # Failed to converge
-    return 0, (0, 0)
-
-import numpy as np
-
-def extract_entity_data(entities):
-    n = len(entities)
-    xs = np.zeros(n, dtype=np.float32)
-    ys = np.zeros(n, dtype=np.float32)
-    vxs = np.zeros(n, dtype=np.float32)
-    vys = np.zeros(n, dtype=np.float32)
-    axs = np.zeros(n, dtype=np.float32)
-    ays = np.zeros(n, dtype=np.float32)
-    radii = np.zeros(n, dtype=np.float32)
-    restitutions = np.zeros(n, dtype=np.float32)
-    frictions = np.zeros(n, dtype=np.float32)
-    for i, e in enumerate(entities):
-        xs[i] = e.x
-        ys[i] = e.y
-        vxs[i] = e.vx
-        vys[i] = e.vy
-        axs[i] = e.ax
-        ays[i] = e.ay
-        radii[i] = e.radius
-        restitutions[i] = e.restitution
-        frictions[i] = e.friction
-    return xs, ys, vxs, vys, axs, ays, radii, restitutions, frictions
-
-
-
-@njit(parallel=True, fastmath=True)
-def integrate_kernel(xs, ys, vxs, vys, axs, ays, radii, restitutions, frictions, width, height, gravity):
-    n = xs.size
-    for i in prange(n):  # ✅ replaces njit.grid(1)
-        # Apply gravity
-        ays[i] += gravity
-
-        # Integrate velocity
-        vxs[i] += axs[i]
-        vys[i] += ays[i]
-
-        # Integrate position
-        xs[i] += vxs[i]
-        ys[i] += vys[i]
-
-        # Reset acceleration
-        axs[i] = 0.0
-        ays[i] = 0.0
-
-        # Apply friction
-        vxs[i] *= frictions[i]
-        vys[i] *= frictions[i]
-
-        r = radii[i]
-        restitution = restitutions[i]
-
-        # Boundary collisions
-        if xs[i] - r < 0:
-            xs[i] = r
-            vxs[i] = -vxs[i] * restitution
-        elif xs[i] + r > width:
-            xs[i] = width - r
-            vxs[i] = -vxs[i] * restitution
-
-        if ys[i] - r < 0:
-            ys[i] = r
-            vys[i] = -vys[i] * restitution
-        elif ys[i] + r > height:
-            ys[i] = height - r
-            vys[i] = -vys[i] * restitution
-
-
+    return 0, (0,0)
 
 # ---------------------------
 # === SPATIAL HASH GRID ====
 # ---------------------------
-
 class SpatialHashGrid:
     """High-performance spatial hash using preallocated cells and neighbor cache."""
     __slots__ = ("width","height","cell_size","cols","rows","cells","neighbor_cache")
@@ -401,7 +237,6 @@ class SpatialHashGrid:
 # ---------------------------
 # ======== ENTITIES =========
 # ---------------------------
-
 class Entity:
     """
     Extended entity to optionally carry polygon vertex list (local-space),
@@ -488,7 +323,7 @@ class Entity:
     # Verlet we use previous positions stored in physics world
     def integrate_verlet(self, prev_x, prev_y, engine):
         # acceleration includes gravity (engine.gravity)
-        ax = self.ax  # per-mass already in apply_force design not used here
+        ax = self.ax # per-mass already in apply_force design not used here
         ay = self.ay + engine.gravity
         new_x = 2.0 * self.x - prev_x + ax
         new_y = 2.0 * self.y - prev_y + ay
@@ -592,7 +427,6 @@ class ObjectPool:
 # ---------------------------
 # ======= SPRING (EX) =======
 # ---------------------------
-
 class Spring:
     __slots__ = ("a","b","rest_length","k","damping")
     def __init__(self, a:Entity, b:Entity, k:float=0.2, rest_length:float=None, damping:float=0.02):
@@ -614,27 +448,56 @@ class Spring:
 # -----------------------
 # ===== COLLISIONS ======
 # -----------------------
-
 def project_polygon_axis(axis, verts):
     """Project polygon verts (list of (x,y)) onto axis (normalized) -> min,max scalars."""
-    minp = dot2(verts[0][0], verts[0][1], axis[0], axis[1])
-    maxp = minp
+    minp = dot2(verts[0], axis); maxp = minp
     for v in verts[1:]:
-        p = dot2(v[0], v[1], axis[0], axis[1])
+        p = dot2(v, axis)
         if p < minp: minp = p
         if p > maxp: maxp = p
     return minp, maxp
+
 def interval_distance(minA, maxA, minB, maxB):
     if minA < minB:
         return minB - maxA
     else:
         return minA - maxB
 
+def sat_polygon_polygon(vertsA, vertsB):
+    """Return (penetration_depth, collision_normal) or (0, None) if no collision."""
+    overlap = float('inf')
+    smallest_axis = None
+
+    def get_axes(verts):
+        axes = []
+        n = len(verts)
+        for i in range(n):
+            p1 = verts[i]
+            p2 = verts[(i+1) % n]
+            edge = (p2[0] - p1[0], p2[1] - p1[1])
+            normal = normalize2(perp2(edge))
+            axes.append(normal)
+        return axes
+
+    axesA = get_axes(vertsA)
+    axesB = get_axes(vertsB)
+
+    for axis in axesA + axesB:
+        minA, maxA = project_polygon_axis(axis, vertsA)
+        minB, maxB = project_polygon_axis(axis, vertsB)
+        dist = interval_distance(minA, maxA, minB, maxB)
+        if dist > 0:
+            return 0, None  # no collision
+        if abs(dist) < overlap:
+            overlap = abs(dist)
+            smallest_axis = axis
+
+    return overlap, smallest_axis
+
 
 # ---------------------------
 # ===== PHYSICS WORLD =======
 # ---------------------------
-
 class PhysicsWorld:
     """
     Manage objects, integrator switching (euler/verlet), spatial hash broadphase,
@@ -722,11 +585,9 @@ class PhysicsWorld:
             for e in self.entities:
                 if e.alive:
                     prev = self.prev_positions.get(e, (e.x - e.vx, e.y - e.vy))
-                    old_x, old_y = e.x, e.y  # store old position before update
                     new_x, new_y = e.integrate_verlet(prev[0], prev[1], self)
-                    self.prev_positions[e] = (old_x, old_y)  # update prev_positions with old pos
-                    e.x = new_x
-                    e.y = new_y
+                    self.prev_positions[e] = (e.x, e.y)
+                    e.x = new_x; e.y = new_y
         tB = time.perf_counter()
         self.time_profile["integrate"] = tB - tA
 
@@ -746,7 +607,6 @@ class PhysicsWorld:
         self.time_profile["broadphase"] = tF - tE
 
         self.collision_pairs_checked = 0
-
 
     # Broadphase spatial
     def _broadphase_spatial(self):
@@ -803,40 +663,10 @@ class PhysicsWorld:
 
     # Collision resolution using SAT if polygons involved
 
-
-    def _resolve_collision_pair(self, a: Entity, b: Entity):
+    def _resolve_collision_pair(self, a:Entity, b:Entity):
         # Helper to get polygon verts in world space
         def get_world_verts(ent):
             return ent.local_to_world_verts()
-
-        # Helper to prepare shape data for gjk_collision
-        def prepare_shape(ent):
-            if ent.shape == Shape.CIRCLE:
-                # circle: type=0, no verts
-                shape_type = 0
-                verts_x = np.empty(0, dtype=np.float64)
-                verts_y = np.empty(0, dtype=np.float64)
-                n = 0
-                center_x = ent.x
-                center_y = ent.y
-                radius = ent.radius
-            else:
-                # polygon: type=1, verts arrays
-                shape_type = 1
-                verts = get_world_verts(ent)
-                if len(verts) == 0:
-                    verts_x = np.empty(0, dtype=np.float64)
-                    verts_y = np.empty(0, dtype=np.float64)
-                    n = 0
-                else:
-                    verts_np = np.array(verts, dtype=np.float64)
-                    verts_x = verts_np[:, 0]
-                    verts_y = verts_np[:, 1]
-                    n = len(verts)
-                center_x = ent.x
-                center_y = ent.y
-                radius = 0.0  # radius unused for polygons here
-            return shape_type, verts_x, verts_y, n, center_x, center_y, radius
 
         # Circle-circle collision
         if a.shape == Shape.CIRCLE and b.shape == Shape.CIRCLE:
@@ -873,23 +703,24 @@ class PhysicsWorld:
             cx = (a.x + b.x) * 0.5
             cy = (a.y + b.y) * 0.5
 
-        # Circle-polygon or polygon-circle collision using GJK + EPA
+        # Circle-polygon collision using GJK + EPA
         else:
-            shapeA_type, vertsA_x, vertsA_y, nA, centerA_x, centerA_y, radiusA = prepare_shape(a)
-            shapeB_type, vertsB_x, vertsB_y, nB, centerB_x, centerB_y, radiusB = prepare_shape(b)
+            # Prepare shapes for GJK
+            def get_shape(ent):
+                if ent.shape == Shape.CIRCLE:
+                    return {'center': (ent.x, ent.y), 'radius': ent.radius}
+                else:
+                    verts = ent.local_to_world_verts()
+                    return {'verts': verts}
 
-            collision, simplex_x, simplex_y = gjk_collision(
-                shapeA_type, vertsA_x, vertsA_y, nA, centerA_x, centerA_y, radiusA,
-                shapeB_type, vertsB_x, vertsB_y, nB, centerB_x, centerB_y, radiusB
-            )
+            shapeA = get_shape(a)
+            shapeB = get_shape(b)
+
+            collision, simplex = gjk_collision(shapeA, shapeB)
             if not collision:
                 return
 
-            penetration, normal = epa(
-                (shapeA_type, vertsA_x, vertsA_y, nA, centerA_x, centerA_y, radiusA),
-                (shapeB_type, vertsB_x, vertsB_y, nB, centerB_x, centerB_y, radiusB),
-                list(zip(simplex_x, simplex_y))
-            )
+            penetration, normal = epa(shapeA, shapeB, simplex)
             if penetration <= 0:
                 return
 
@@ -908,7 +739,7 @@ class PhysicsWorld:
         velB = (b.vx - b.angular_velocity * rB[1], b.vy + b.angular_velocity * rB[0])
         rv = (velB[0] - velA[0], velB[1] - velA[1])
 
-        vel_along_normal = rv[0] * nx + rv[1] * ny
+        vel_along_normal = rv[0]*nx + rv[1]*ny
         if vel_along_normal > 0:
             return
 
@@ -918,15 +749,15 @@ class PhysicsWorld:
         invInertiaA = a.inv_inertia
         invInertiaB = b.inv_inertia
 
-        crossA = rA[0] * ny - rA[1] * nx
-        crossB = rB[0] * ny - rB[1] * nx
+        crossA = rA[0]*ny - rA[1]*nx
+        crossB = rB[0]*ny - rB[1]*nx
 
-        denom = invMassA + invMassB + (crossA * crossA) * invInertiaA + (crossB * crossB) * invInertiaB
+        denom = invMassA + invMassB + (crossA*crossA)*invInertiaA + (crossB*crossB)*invInertiaB
         if denom == 0:
             return
 
         j = -(1 + e) * vel_along_normal / denom
-        impulse = (j * nx, j * ny)
+        impulse = (j*nx, j*ny)
 
         # Apply linear impulse
         a.vx -= impulse[0] * invMassA
@@ -1012,21 +843,7 @@ def regular_polygon_vertices(sides: int, radius: float) -> List[Tuple[float, flo
         verts.append((x, y))
     return verts
 
-class Button:
-    def __init__(self, rect, text, font, bg_color=(50,50,50), fg_color=(220,220,220)):
-        self.rect = pygame.Rect(rect)
-        self.text = text
-        self.font = font
-        self.bg_color = bg_color
-        self.fg_color = fg_color
-        self.surface = self.font.render(self.text, True, self.fg_color)
-        self.surface_rect = self.surface.get_rect(center=self.rect.center)
-    def draw(self, surf):
-        pygame.draw.rect(surf, self.bg_color, self.rect, border_radius=6)
-        pygame.draw.rect(surf, (200,200,200), self.rect, 2, border_radius=6)
-        surf.blit(self.surface, self.surface_rect)
-    def is_pressed(self, pos):
-        return self.rect.collidepoint(pos)
+
 
 # ---------------------------
 # ======== ENGINE = =========
@@ -1048,23 +865,6 @@ class Engine:
 
         # Initialize font and buttons for GUI controls
         self.font = pygame.font.SysFont(None, 24)
-
-        btn_w, btn_h = 90, 32
-        margin = 6
-        screen_w, screen_h = self.width, self.height
-    
-        self.buttons = [
-            Button((margin, screen_h - btn_h - margin, btn_w, btn_h), "Grid (G)", self.font),
-            Button((margin*2 + btn_w, screen_h - btn_h - margin, btn_w, btn_h), "HUD (H)", self.font),
-            Button((margin*10 + btn_w*11, screen_h - btn_h - margin, btn_w+50, btn_h), "Integrator (V)", self.font),
-            Button((margin*3 + btn_w*2, screen_h - btn_h - margin, btn_w, btn_h), "Pause (P)", self.font),
-            Button((margin*4 + btn_w*3, screen_h - btn_h - margin, btn_w, btn_h), "Record (R)", self.font),
-            Button((margin*5 + btn_w*4, screen_h - btn_h - margin, btn_w, btn_h), "+100 (+)", self.font),
-            Button((margin*6 + btn_w*5, screen_h - btn_h - margin, btn_w, btn_h), "-100 (-)", self.font),
-            Button((margin*7 + btn_w*6, screen_h - btn_h - margin, btn_w, btn_h), "Clear (C)", self.font),
-            Button((margin*8 + btn_w*7, screen_h - btn_h - margin, btn_w + 50, btn_h), "Grav + (Up)", self.font),
-            Button((margin*9 + btn_w*8+50, screen_h - btn_h - margin, btn_w + 50, btn_h), "Grav - (Down)", self.font),
-        ]
 
 
         self.running = True
@@ -1106,31 +906,11 @@ class Engine:
                 elif ev.type == pygame.KEYDOWN:
                     self._on_key(ev.key)
 
-                elif ev.type == pygame.MOUSEBUTTONDOWN:
-                    mx, my = pygame.mouse.get_pos()
-                    # Check if any button was pressed
-                    for btn in self.buttons:
-                        if btn.is_pressed((mx,my)):
-                            self._on_button(btn.text)
-                            break
-                    else:
-                        # If no button pressed, spawn balls on left click
-                        if ev.button == 1:
-                            for _ in range(12):
-                                r = random.randint(3,7)
-                                e = self.world.spawn_ball(mx + random.uniform(-8,8), my + random.uniform(-8,8), r)
-                                e.vx = random.uniform(-3,3)
-                                e.vy = random.uniform(-3,3)
-
-
             if not self.paused:
                 self.world.step()
             self.screen.fill((18,18,24))
             self.renderer.draw(draw_grid=self.draw_grid, draw_hud=self.draw_hud)
 
-            # Draw GUI buttons on top
-            for btn in self.buttons:
-                btn.draw(self.screen)
 
             pygame.display.flip()
             if self.recording:
@@ -1202,54 +982,6 @@ class Engine:
             verts = regular_polygon_vertices(sides, radius)
             self.world.spawn_polygon(x, y, verts, color=(random.randint(60,255),random.randint(60,255),random.randint(60,255)), mass=radius * sides * 0.5)
             print(f"Spawned regular polygon with {sides} sides")
-
-
-
-    def _on_button(self, label):
-        # Map button label to actions
-        if "Grid" in label:
-            self.draw_grid = not self.draw_grid
-            print("Grid toggled:", self.draw_grid)
-        elif "HUD" in label:
-            self.draw_hud = not self.draw_hud
-            print("HUD toggled:", self.draw_hud)
-        elif "Integrator" in label:
-            self.world.integrator = "verlet" if self.world.integrator == "euler" else "euler"
-            if self.world.integrator == "verlet":
-                for e in self.world.entities:
-                    self.world.prev_positions[e] = (e.x - e.vx, e.y - e.vy)
-            print("Integrator:", self.world.integrator)
-        elif "Pause" in label:
-            self.paused = not self.paused
-            print("Paused:", self.paused)
-        elif "Record" in label:
-            self.recording = not self.recording
-            if self.recording and not os.path.exists(FRAME_DIR):
-                os.makedirs(FRAME_DIR)
-            print("Recording:", self.recording)
-        elif "+100" in label:
-            for _ in range(100):
-                r = random.randint(MIN_RADIUS, MAX_RADIUS)
-                x = random.uniform(16 + r, self.width - 16 - r)
-                y = random.uniform(16 + r, self.height - 16 - r)
-                self.world.spawn_ball(x,y,r)
-            print("Spawned +100, total:", len(self.world.entities))
-        elif "-100" in label:
-            toremove = min(100, len(self.world.entities))
-            for _ in range(toremove):
-                ent = self.world.entities.pop()
-                if self.world.use_pool and self.world.pool:
-                    self.world.pool.release(ent)
-            print("Removed -100, total:", len(self.world.entities))
-        elif "Clear" in label:
-            self._clear_and_respawn(100)
-            print("Cleared & respawned 100")
-        elif "Grav +" in label:
-            self.world.gravity += 0.1
-            print("Gravity:", self.world.gravity)
-        elif "Grav -" in label:
-            self.world.gravity -= 0.1
-            print("Gravity:", self.world.gravity)
 
 
     def _clear_and_respawn(self, n):
