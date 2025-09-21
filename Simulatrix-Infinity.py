@@ -124,7 +124,7 @@ def triple_product(ax, ay, bx, by, cx, cy):
     return bx * ac - cx * ab, by * ac - cy * ab
 
 
-@njit(parallel=True, fastmath=True)
+@njit(fastmath=True)
 def gjk_collision(shapeA_type, vertsA_x, vertsA_y, nA, centerA_x, centerA_y, radiusA,
                   shapeB_type, vertsB_x, vertsB_y, nB, centerB_x, centerB_y, radiusB):
     direction = np.array([1.0, 0.0])
@@ -488,7 +488,7 @@ class Entity:
     # Verlet we use previous positions stored in physics world
     def integrate_verlet(self, prev_x, prev_y, engine):
         # acceleration includes gravity (engine.gravity)
-        ax = self.ax # per-mass already in apply_force design not used here
+        ax = self.ax  # per-mass already in apply_force design not used here
         ay = self.ay + engine.gravity
         new_x = 2.0 * self.x - prev_x + ax
         new_y = 2.0 * self.y - prev_y + ay
@@ -617,13 +617,13 @@ class Spring:
 
 def project_polygon_axis(axis, verts):
     """Project polygon verts (list of (x,y)) onto axis (normalized) -> min,max scalars."""
-    minp = dot2(verts[0], axis); maxp = minp
+    minp = dot2(verts[0][0], verts[0][1], axis[0], axis[1])
+    maxp = minp
     for v in verts[1:]:
-        p = dot2(v, axis)
+        p = dot2(v[0], v[1], axis[0], axis[1])
         if p < minp: minp = p
         if p > maxp: maxp = p
     return minp, maxp
-
 def interval_distance(minA, maxA, minB, maxB):
     if minA < minB:
         return minB - maxA
@@ -713,9 +713,7 @@ class PhysicsWorld:
         self.time_profile["resolve"] = 0.0
         self.time_profile["constraints"] = 0.0
 
-        # --- Integration ---
         tA = time.perf_counter()
-
         if self.integrator == "euler":
             for e in self.entities:
                 if e.alive:
@@ -724,15 +722,14 @@ class PhysicsWorld:
             for e in self.entities:
                 if e.alive:
                     prev = self.prev_positions.get(e, (e.x - e.vx, e.y - e.vy))
+                    old_x, old_y = e.x, e.y  # store old position before update
                     new_x, new_y = e.integrate_verlet(prev[0], prev[1], self)
-                    self.prev_positions[e] = (e.x, e.y)
+                    self.prev_positions[e] = (old_x, old_y)  # update prev_positions with old pos
                     e.x = new_x
                     e.y = new_y
-
         tB = time.perf_counter()
         self.time_profile["integrate"] = tB - tA
 
-        # --- Constraints (springs) ---
         tC = time.perf_counter()
         if self.springs:
             for s in self.springs:
@@ -740,7 +737,6 @@ class PhysicsWorld:
         tD = time.perf_counter()
         self.time_profile["constraints"] = tD - tC
 
-        # --- Broadphase ---
         tE = time.perf_counter()
         if self.use_spatial_hash:
             self._broadphase_spatial()
@@ -750,26 +746,6 @@ class PhysicsWorld:
         self.time_profile["broadphase"] = tF - tE
 
         self.collision_pairs_checked = 0
-
-        # --- Extract entity data ---
-        xs, ys, vxs, vys, axs, ays, radii, restitutions, frictions = extract_entity_data(self.entities)
-
-        # --- Parallel integration ---
-        integrate_kernel(xs, ys, vxs, vys, axs, ays, radii, restitutions, frictions,
-                        self.width, self.height, self.gravity)
-
-        # --- Update entity objects ---
-        for i, e in enumerate(self.entities):
-            e.x = xs[i]
-            e.y = ys[i]
-            e.vx = vxs[i]
-            e.vy = vys[i]
-            e.ax = axs[i]
-            e.ay = ays[i]
-
-
-        t1 = time.perf_counter()
-        self.time_profile["step"] = t1 - t0
 
 
     # Broadphase spatial
@@ -1036,6 +1012,21 @@ def regular_polygon_vertices(sides: int, radius: float) -> List[Tuple[float, flo
         verts.append((x, y))
     return verts
 
+class Button:
+    def __init__(self, rect, text, font, bg_color=(50,50,50), fg_color=(220,220,220)):
+        self.rect = pygame.Rect(rect)
+        self.text = text
+        self.font = font
+        self.bg_color = bg_color
+        self.fg_color = fg_color
+        self.surface = self.font.render(self.text, True, self.fg_color)
+        self.surface_rect = self.surface.get_rect(center=self.rect.center)
+    def draw(self, surf):
+        pygame.draw.rect(surf, self.bg_color, self.rect, border_radius=6)
+        pygame.draw.rect(surf, (200,200,200), self.rect, 2, border_radius=6)
+        surf.blit(self.surface, self.surface_rect)
+    def is_pressed(self, pos):
+        return self.rect.collidepoint(pos)
 
 # ---------------------------
 # ======== ENGINE = =========
@@ -1057,6 +1048,23 @@ class Engine:
 
         # Initialize font and buttons for GUI controls
         self.font = pygame.font.SysFont(None, 24)
+
+        btn_w, btn_h = 90, 32
+        margin = 6
+        screen_w, screen_h = self.width, self.height
+    
+        self.buttons = [
+            Button((margin, screen_h - btn_h - margin, btn_w, btn_h), "Grid (G)", self.font),
+            Button((margin*2 + btn_w, screen_h - btn_h - margin, btn_w, btn_h), "HUD (H)", self.font),
+            Button((margin*10 + btn_w*11, screen_h - btn_h - margin, btn_w+50, btn_h), "Integrator (V)", self.font),
+            Button((margin*3 + btn_w*2, screen_h - btn_h - margin, btn_w, btn_h), "Pause (P)", self.font),
+            Button((margin*4 + btn_w*3, screen_h - btn_h - margin, btn_w, btn_h), "Record (R)", self.font),
+            Button((margin*5 + btn_w*4, screen_h - btn_h - margin, btn_w, btn_h), "+100 (+)", self.font),
+            Button((margin*6 + btn_w*5, screen_h - btn_h - margin, btn_w, btn_h), "-100 (-)", self.font),
+            Button((margin*7 + btn_w*6, screen_h - btn_h - margin, btn_w, btn_h), "Clear (C)", self.font),
+            Button((margin*8 + btn_w*7, screen_h - btn_h - margin, btn_w + 50, btn_h), "Grav + (Up)", self.font),
+            Button((margin*9 + btn_w*8+50, screen_h - btn_h - margin, btn_w + 50, btn_h), "Grav - (Down)", self.font),
+        ]
 
 
         self.running = True
@@ -1100,27 +1108,19 @@ class Engine:
 
                 elif ev.type == pygame.MOUSEBUTTONDOWN:
                     mx, my = pygame.mouse.get_pos()
-                    if ev.button == 1:
-                        for _ in range(12):
-                            r = random.randint(3,7)
-                            e = self.world.spawn_ball(mx + random.uniform(-8,8), my + random.uniform(-8,8), r)
-                            e.vx = random.uniform(-3,3)
-                            e.vy = random.uniform(-3,3)
-                elif ev.type == pygame.MOUSEBUTTONDOWN:
-                  mx, my = pygame.mouse.get_pos()
-                  # Check buttons first
-                  for btn in self.buttons:
-                     if btn.is_pressed((mx,my)):
-                           self._on_button(btn.text)
-                           break
-                  else:
-                     # If no button pressed, spawn balls on left click
-                     if ev.button == 1:
-                           for _ in range(12):
-                              r = random.randint(3,7)
-                              e = self.world.spawn_ball(mx + random.uniform(-8,8), my + random.uniform(-8,8), r)
-                              e.vx = random.uniform(-3,3)
-                              e.vy = random.uniform(-3,3)
+                    # Check if any button was pressed
+                    for btn in self.buttons:
+                        if btn.is_pressed((mx,my)):
+                            self._on_button(btn.text)
+                            break
+                    else:
+                        # If no button pressed, spawn balls on left click
+                        if ev.button == 1:
+                            for _ in range(12):
+                                r = random.randint(3,7)
+                                e = self.world.spawn_ball(mx + random.uniform(-8,8), my + random.uniform(-8,8), r)
+                                e.vx = random.uniform(-3,3)
+                                e.vy = random.uniform(-3,3)
 
 
             if not self.paused:
@@ -1128,6 +1128,9 @@ class Engine:
             self.screen.fill((18,18,24))
             self.renderer.draw(draw_grid=self.draw_grid, draw_hud=self.draw_hud)
 
+            # Draw GUI buttons on top
+            for btn in self.buttons:
+                btn.draw(self.screen)
 
             pygame.display.flip()
             if self.recording:
@@ -1199,6 +1202,54 @@ class Engine:
             verts = regular_polygon_vertices(sides, radius)
             self.world.spawn_polygon(x, y, verts, color=(random.randint(60,255),random.randint(60,255),random.randint(60,255)), mass=radius * sides * 0.5)
             print(f"Spawned regular polygon with {sides} sides")
+
+
+
+    def _on_button(self, label):
+        # Map button label to actions
+        if "Grid" in label:
+            self.draw_grid = not self.draw_grid
+            print("Grid toggled:", self.draw_grid)
+        elif "HUD" in label:
+            self.draw_hud = not self.draw_hud
+            print("HUD toggled:", self.draw_hud)
+        elif "Integrator" in label:
+            self.world.integrator = "verlet" if self.world.integrator == "euler" else "euler"
+            if self.world.integrator == "verlet":
+                for e in self.world.entities:
+                    self.world.prev_positions[e] = (e.x - e.vx, e.y - e.vy)
+            print("Integrator:", self.world.integrator)
+        elif "Pause" in label:
+            self.paused = not self.paused
+            print("Paused:", self.paused)
+        elif "Record" in label:
+            self.recording = not self.recording
+            if self.recording and not os.path.exists(FRAME_DIR):
+                os.makedirs(FRAME_DIR)
+            print("Recording:", self.recording)
+        elif "+100" in label:
+            for _ in range(100):
+                r = random.randint(MIN_RADIUS, MAX_RADIUS)
+                x = random.uniform(16 + r, self.width - 16 - r)
+                y = random.uniform(16 + r, self.height - 16 - r)
+                self.world.spawn_ball(x,y,r)
+            print("Spawned +100, total:", len(self.world.entities))
+        elif "-100" in label:
+            toremove = min(100, len(self.world.entities))
+            for _ in range(toremove):
+                ent = self.world.entities.pop()
+                if self.world.use_pool and self.world.pool:
+                    self.world.pool.release(ent)
+            print("Removed -100, total:", len(self.world.entities))
+        elif "Clear" in label:
+            self._clear_and_respawn(100)
+            print("Cleared & respawned 100")
+        elif "Grav +" in label:
+            self.world.gravity += 0.1
+            print("Gravity:", self.world.gravity)
+        elif "Grav -" in label:
+            self.world.gravity -= 0.1
+            print("Gravity:", self.world.gravity)
 
 
     def _clear_and_respawn(self, n):
