@@ -27,7 +27,7 @@
 | Spatial Hashing          | ✅ Optimized            | ✅ Optimized      | ✅ Basic       | ❌ Not Implemented   |
 | Object Pooling           | ✅ Yes                  | ✅ Yes            | ✅ Yes         | ✅ Yes               |
 | Debug HUD                | ✅ Yes                  | ✅ Yes            | ✅ Yes         | ✅ Yes               |
-| GUI Controls             | ❌ No                  | ❌ No            | ❌ No          | ❌ No                |
+| GUI Controls             | ✅ Yes                 | ❌ No            | ❌ No          | ❌ No                |
 | Mobile Support (Pydroid) | ✅ Yes                  | ✅ Yes            | ✅ Yes          | ✅ Yes                |
 | Performance              | ⚡ High                 | ⚡ Moderate           | ⚡ High    | ⚡ High               |
 
