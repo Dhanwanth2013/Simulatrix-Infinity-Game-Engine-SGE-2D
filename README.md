@@ -70,7 +70,6 @@ Simulatrix Infinity has been optimized for performance, achieving over 60 FPS wi
 
 **Key optimizations include:**
 
-* **Numba JIT Compilation**: Accelerates core physics computations.
 * **Object Pooling**: Reduces garbage collection overhead.
 * **Spatial Hashing**: Minimizes collision checks.
 
